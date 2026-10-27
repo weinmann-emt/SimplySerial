@@ -369,6 +369,8 @@ namespace SimplySerial
                     try
                     {
                         // process keypresses for transmission through the serial port
+                        // (keys are collected and sent with a single write to avoid per-character overhead when pasting)
+                        StringBuilder txData = new StringBuilder();
                         while (Console.KeyAvailable)
                         {
                             // determine what key is pressed (including modifiers)
@@ -383,22 +385,21 @@ namespace SimplySerial
 
                             // check for keys that require special processing (cursor keys, etc.)
                             else if (specialKeys.ContainsKey(keyInfo.Key))
-                            {
-                                serialPort.Write(specialKeys[keyInfo.Key]);
-                                if (localEcho)
-                                    Output(specialKeys[keyInfo.Key], force: true, newline: false);
-                            }
+                                txData.Append(specialKeys[keyInfo.Key]);
 
                             // everything else just gets sent right on through
                             else
-                            {
-                                string outstring = keyInfo.KeyChar.ToString();
-                                serialPort.Write(outstring);
-                                if (localEcho)
-                                    Output(outstring, force: true, newline: false);
-                            }
+                                txData.Append(keyInfo.KeyChar);
+
                             if (!bulkSend)
                                 break;
+                        }
+                        if (txData.Length > 0)
+                        {
+                            string outstring = txData.ToString();
+                            serialPort.Write(outstring);
+                            if (localEcho)
+                                Output(outstring, force: true, newline: false);
                         }
 
                         // process data coming in from the serial port
@@ -421,7 +422,7 @@ namespace SimplySerial
                             Output(received, force: true, newline: false);
                             start = DateTime.Now;
                         }
-                        else
+                        else if (!Console.KeyAvailable)
                             Thread.Sleep(1);
 
                         if (logging)
