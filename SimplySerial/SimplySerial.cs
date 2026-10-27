@@ -70,6 +70,18 @@ namespace SimplySerial
         static ConsoleKey exitKey = ConsoleKey.X;
         static bool localEcho = false;
         static bool bulkSend = false;
+        static bool syncOutput = true;
+
+        // synchronized output (DEC private mode 2026) sent by the device: the terminal defers rendering between
+        // BSU and ESU, but only for a short time (100ms in Windows Terminal) - at serial speeds a frame often takes
+        // longer than that to arrive, so each frame is collected here and written to the console in one piece
+        const string SyncBegin = "\x1b[?2026h";
+        const string SyncEnd = "\x1b[?2026l";
+        static bool deviceSync = false;
+        static StringBuilder heldFrame = new StringBuilder();
+        static bool inDeviceFrame = false;
+        static DateTime deviceFrameStart = DateTime.Now;
+        const double DeviceFrameTimeoutMs = 1000; // release an unterminated frame after this long
 
         // dictionary of "special" keys with the corresponding string to send out when they are pressed
         static Dictionary<ConsoleKey, String> specialKeys = new Dictionary<ConsoleKey, String>
@@ -418,12 +430,29 @@ namespace SimplySerial
                             if (forceNewline)
                                 received = received.Replace("\r", "\n");
 
+                            // once the device uses synchronized output, hold back each of its frames until complete
+                            if (syncOutput && !deviceSync && received.Contains("\x1b[?2026"))
+                                deviceSync = true;
+                            if (deviceSync)
+                                received = HoldDeviceFrame(received);
+
                             // write what was received to console
-                            Output(received, force: true, newline: false);
+                            if (received.Length > 0)
+                                Output(received, force: true, newline: false);
                             start = DateTime.Now;
                         }
-                        else if (!Console.KeyAvailable)
-                            Thread.Sleep(1);
+                        else
+                        {
+                            // release a held frame if its ESU never arrives
+                            if (deviceSync && heldFrame.Length > 0)
+                            {
+                                received = HoldDeviceFrame("");
+                                if (received.Length > 0)
+                                    Output(received, force: true, newline: false);
+                            }
+                            if (!Console.KeyAvailable)
+                                Thread.Sleep(1);
+                        }
 
                         if (logging)
                         {
@@ -756,6 +785,82 @@ namespace SimplySerial
             bulkSend = ArgProcessor_OnOff(value);
         }
 
+        static void ArgHandler_SyncOutput(string value)
+        {
+            syncOutput = ArgProcessor_OnOff(value);
+        }
+
+        /// <summary>
+        /// Buffers received data so that everything between the device's BSU and ESU is returned (and therefore
+        /// written to the console) in one piece.  Returns the data that is ready to be written now.
+        /// </summary>
+        static string HoldDeviceFrame(string data)
+        {
+            bool hadPartialBsu = !inDeviceFrame && heldFrame.Length > 0;
+            heldFrame.Append(data);
+            string pending = heldFrame.ToString();
+            StringBuilder ready = new StringBuilder();
+
+            while (true)
+            {
+                if (!inDeviceFrame)
+                {
+                    int bsu = pending.IndexOf(SyncBegin, StringComparison.Ordinal);
+                    if (bsu < 0)
+                    {
+                        // no frame started - write everything except a trailing partial BSU, which is
+                        // held until it can be identified (or released after a timeout)
+                        int keep = PartialMarkerLength(pending, SyncBegin);
+                        if (keep > 0 && !hadPartialBsu)
+                            deviceFrameStart = DateTime.Now;
+                        else if (keep > 0 && (DateTime.Now - deviceFrameStart).TotalMilliseconds >= DeviceFrameTimeoutMs)
+                            keep = 0;
+                        ready.Append(pending, 0, pending.Length - keep);
+                        pending = pending.Substring(pending.Length - keep);
+                        break;
+                    }
+
+                    // write data preceding the frame, hold the frame itself (pending now starts with BSU)
+                    ready.Append(pending, 0, bsu);
+                    pending = pending.Substring(bsu);
+                    inDeviceFrame = true;
+                    deviceFrameStart = DateTime.Now;
+                }
+
+                int esu = pending.IndexOf(SyncEnd, SyncBegin.Length, StringComparison.Ordinal);
+                if (esu < 0)
+                {
+                    // frame incomplete - release it anyway if the device never ends it
+                    if ((DateTime.Now - deviceFrameStart).TotalMilliseconds >= DeviceFrameTimeoutMs)
+                    {
+                        ready.Append(pending);
+                        pending = string.Empty;
+                        inDeviceFrame = false;
+                    }
+                    break;
+                }
+
+                // complete frame (BSU ... ESU) - write it in one piece
+                ready.Append(pending, 0, esu + SyncEnd.Length);
+                pending = pending.Substring(esu + SyncEnd.Length);
+                inDeviceFrame = false;
+            }
+
+            heldFrame.Clear().Append(pending);
+            return ready.ToString();
+        }
+
+        /// <summary>
+        /// Returns the length of the longest suffix of 'text' that is a (proper) prefix of 'marker'.
+        /// </summary>
+        static int PartialMarkerLength(string text, string marker)
+        {
+            for (int len = Math.Min(marker.Length - 1, text.Length); len > 0; len--)
+                if (string.CompareOrdinal(text, text.Length - len, marker, 0, len) == 0)
+                    return len;
+            return 0;
+        }
+
         static void ArgHandler_UpdateBoards(string value)
         {
             BoardManager.Update();
@@ -916,6 +1021,7 @@ namespace SimplySerial
             CommandLineArguments.Add("echo", new CommandLineArgument("echo", handler: ArgHandler_Echo));
             CommandLineArguments.Add("exitkey", new CommandLineArgument("exitkey", handler: ArgHandler_ExitKey));
             CommandLineArguments.Add("forcenewline", new CommandLineArgument("forcenewline", handler: ArgHandler_ForceNewLine));
+            CommandLineArguments.Add("syncoutput", new CommandLineArgument("syncoutput", handler: ArgHandler_SyncOutput));
             CommandLineArguments.Add("logmode", new CommandLineArgument("logmode", handler: ArgHandler_LogMode));
             CommandLineArguments.Add("logtime", new CommandLineArgument("logtime", handler: ArgHandler_LogTime));
             CommandLineArguments.Add("parity", new CommandLineArgument("parity", handler: ArgHandler_Parity));
@@ -1114,7 +1220,8 @@ namespace SimplySerial
             Console.WriteLine("  -exitkey:KEY      Specify a key to use along with CTRL for exiting the program (default is 'X').");
             Console.WriteLine("  -title:\"TITLE\"  Set the console window title.  Surround with quotation marks if your title has spaces.");
             Console.WriteLine("  -bulksend:VAL     ON | OFF enable or disable bulk send mode (send all characters typed/pasted at once).");
-            Console.WriteLine("  -txonenter:VAL    CR | LF | CRLF | CUSTOM=\"CustomString\" | BYTES=\"custom sequence of bytes\", each byte must be expressed by 2 chars.");
+            Console.WriteLine("  -syncoutput:VAL   ON | OFF enable/disable collecting synchronized output frames (DEC mode 2026) sent by the device, default is ON");
+            Console.WriteLine("  -txonenter:VAL   CR | LF | CRLF | CUSTOM=\"CustomString\" | BYTES=\"custom sequence of bytes\", each byte must be expressed by 2 chars.");
             Console.WriteLine("                    Bytes sequence must be a hexadecimal value with or without leading 0x and separated or not by spaces.");
             Console.WriteLine("                    Determines what character(s) will be sent when the enter key is pressed.");
             Console.WriteLine("  -config:FILE      Load command-line arguments from the specified configuration file. (One command per line.)");
